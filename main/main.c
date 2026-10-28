@@ -8,10 +8,16 @@
 #include "driver/i2c_master.h"
 #include "vl53l5cx_api.h"
 
+// VL53L5CX
 #define I2C_SDA_GPIO       GPIO_NUM_21
 #define I2C_SCL_GPIO       GPIO_NUM_22
 #define I2C_PORT           I2C_NUM_1
 #define I2C_FREQUENCY_HZ   1000000
+
+// PCM5102A
+#define I2S_LCK_GPIO       GPIO_NUM_25
+#define I2S_BCK_GPIO       GPIO_NUM_26
+#define I2S_DIN_GPIO       GPIO_NUM_27
 
 void app_main(void)
 {
