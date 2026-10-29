@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <stdint.h>
 #include <math.h>
@@ -6,7 +7,7 @@
 #include "freertos/task.h"
 #include "esp_err.h"
 #include "driver/i2c_master.h"
-#include "driver/i2s.h" // PCM5102A
+#include "driver/i2s_std.h" // PCM5102A
 #include "vl53l5cx_api.h"
 
 // VL53L5C
