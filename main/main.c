@@ -1,7 +1,8 @@
 
-#include <stdio.h>
-#include <stdint.h>
-#include <math.h>
+#include <stdio.h> // logs
+//#include <stdint.h>
+//#include <stdlib.h>
+#include <math.h> // dsp
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -10,11 +11,32 @@
 #include "driver/i2s_std.h" // PCM5102A
 #include "vl53l5cx_api.h"
 
-// VL53L5C
-#define I2C_SDA_GPIO       GPIO_NUM_21
-#define I2C_SCL_GPIO       GPIO_NUM_22
-#define I2C_PORT           I2C_NUM_1
-#define I2C_FREQUENCY_HZ   1000000
+/*
+esp      vl53_1      vl53_2      pcm
+3v3      vin         vin         vin,xsmt
+gnd      gnd         gnd         gnd,sck,fmt,demp,flt
+d21      sda_ok
+d22      scl_ok
+d18                  sda_ok
+d19                  scl_ok
+d27                              din
+d26                              bck
+d25                              lck
+
+PCM5102A XSMT mutes on LOW
+*/
+
+// VL53L5C_1
+#define TOF1_I2C_SDA_GPIO       GPIO_NUM_21
+#define TOF1_I2C_SCL_GPIO       GPIO_NUM_22
+#define TOF1_I2C_PORT           I2C_NUM_0
+#define TOF1_I2C_FREQUENCY_HZ   1000000
+
+// VL53L5C_2
+#define TOF2_I2C_SDA_GPIO       GPIO_NUM_18
+#define TOF2_I2C_SCL_GPIO       GPIO_NUM_19
+#define TOF2_I2C_PORT           I2C_NUM_1
+#define TOF2_I2C_FREQUENCY_HZ   1000000
 
 // PCM5102A
 #define I2S_LCK_GPIO       GPIO_NUM_25
@@ -22,234 +44,261 @@
 #define I2S_DIN_GPIO       GPIO_NUM_27
 
 #define SAMPLE_RATE 44100
-#define TONE_FREQ   1000
-#define AMPLITUDE   10000
+#define TONE_FREQ   440
+#define AMPLITUDE   5000
 
-void pcm5102a() {
-  Serial.begin(115200);
-  delay(1000);
+void pcm5102a(void *pv) {
+  i2s_chan_handle_t tx_chan;
 
-  Serial.println("Teste ESP32 + PCM5102A");
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  chan_cfg.dma_desc_num = 8;
+  chan_cfg.dma_frame_num = 256;
+  chan_cfg.auto_clear = true;
 
-  i2s_config_t config = {
-    .mode = (i2s_mode_t)(
-      I2S_MODE_MASTER | I2S_MODE_TX
+  i2s_std_config_t std_cfg = {
+    .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+      I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO
     ),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = 0,
-    .dma_buf_count = 8,
-    .dma_buf_len = 256,
-    .use_apll = false,
-    .tx_desc_auto_clear = true,
-    .fixed_mclk = 0
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = I2S_BCK_GPIO,
+      .ws   = I2S_LCK_GPIO,
+      .dout = I2S_DIN_GPIO,
+      .din  = I2S_GPIO_UNUSED,
+      .invert_flags = {
+        .mclk_inv = false,
+        .bclk_inv = false,
+        .ws_inv   = false,
+      },
+    },
   };
 
-  i2s_pin_config_t pins = {
-    .bck_io_num = I2S_BCK_GPIO,
-    .ws_io_num = I2S_LCK_GPIO,
-    .data_out_num = I2S_DIN_GPIO,
-    .data_in_num = I2S_PIN_NO_CHANGE
-  };
-
-  esp_err_t err;
-
-  err = i2s_driver_install(I2S_NUM_0, &config, 0, NULL);
-  if (err != ESP_OK) {
-    Serial.printf("Erro I2S: %d\n", err);
-    return;
+  if(
+    i2s_new_channel(&chan_cfg, &tx_chan, NULL) != ESP_OK ||
+    i2s_channel_init_std_mode(tx_chan, &std_cfg) != ESP_OK ||
+    i2s_channel_enable(tx_chan) != ESP_OK
+  ) {
+    printf("Erro ao iniciar I2S\n");
+    vTaskDelete(NULL);
   }
-
-  err = i2s_set_pin(I2S_NUM_0, &pins);
-  if (err != ESP_OK) {
-    Serial.printf("Erro nos pinos: %d\n", err);
-    return;
-  }
-
-  i2s_zero_dma_buffer(I2S_NUM_0);
-
-  Serial.println("Gerando tom de 1 kHz...");
 
   static int16_t buffer[512];
-  static float phase = 0.0f;
+  float phase = 0.0f;
+  const float step = 2.0f * M_PI * TONE_FREQ / SAMPLE_RATE;
 
-  const float step =
-    2.0f * PI * TONE_FREQ / SAMPLE_RATE;
-
-  for (int i = 0; i < 256; i++) {
-    int16_t sample =
-      (int16_t)(AMPLITUDE * sinf(phase));
-
-    phase += step;
-    if (phase >= 2.0f * PI) {
-      phase -= 2.0f * PI;
+  while(1) {
+    for(int i = 0; i < 256; i++) {
+      int16_t s = (int16_t)(AMPLITUDE * sinf(phase));
+      phase += step;
+      if (phase >= 2.0f * M_PI) phase -= 2.0f * M_PI;
+      buffer[2 * i] = buffer[2 * i + 1] = s;
     }
-
-    // Áudio estéreo: mesmo sinal nos dois canais
-    buffer[i * 2]     = sample; // LEFT
-    buffer[i * 2 + 1] = sample; // RIGHT
+    size_t written;
+    i2s_channel_write(tx_chan, buffer, sizeof(buffer), &written, portMAX_DELAY);
   }
-
-  size_t bytes_written = 0;
-
-  i2s_write(
-    I2S_NUM_0,
-    buffer,
-    sizeof(buffer),
-    &bytes_written,
-    portMAX_DELAY
-  );
 }
 
-void vl53l5c() {
-    esp_err_t err;
-    uint8_t status = 0;
-    uint8_t is_alive = 0;
-    uint8_t is_ready = 0;
-    uint8_t zone;
+typedef struct {
+  gpio_num_t sda_gpio;
+  gpio_num_t scl_gpio;
+  i2c_port_t i2c_port;
+  uint32_t i2c_frequency_hz;
+  char name[32];
+} vl53l5cx_platform_t;
 
-    VL53L5CX_Configuration Dev = {0};
-    VL53L5CX_ResultsData Results = {0};
+static vl53l5cx_platform_t tof1_platform = {
+  .sda_gpio = TOF1_I2C_SDA_GPIO,
+  .scl_gpio = TOF1_I2C_SCL_GPIO,
+  .i2c_port = TOF1_I2C_PORT,
+  .i2c_frequency_hz = TOF1_I2C_FREQUENCY_HZ,
+  .name = "TOF1"
+};
 
-    printf("\nInicializando barramento I2C...\n");
+static vl53l5cx_platform_t tof2_platform = {
+  .sda_gpio = TOF2_I2C_SDA_GPIO,
+  .scl_gpio = TOF2_I2C_SCL_GPIO,
+  .i2c_port = TOF2_I2C_PORT,
+  .i2c_frequency_hz = TOF2_I2C_FREQUENCY_HZ,
+  .name = "TOF2"
+};
 
-    i2c_master_bus_config_t i2c_config = {
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .i2c_port = I2C_PORT,
-        .scl_io_num = I2C_SCL_GPIO,
-        .sda_io_num = I2C_SDA_GPIO,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
+void vl53l5c(void *pvParameters) {
+  vl53l5cx_platform_t *platform = (vl53l5cx_platform_t *)pvParameters;
+  printf("\n[%s] Iniciando sensor VL53L5CX...\n", platform->name);
 
-    i2c_master_bus_handle_t bus_handle;
+  esp_err_t err;
+  uint8_t status = 0;
+  uint8_t is_alive = 0;
+  uint8_t is_ready = 0;
+  uint8_t zone;
 
-    err = i2c_new_master_bus(&i2c_config, &bus_handle);
-    if (err != ESP_OK) {
-        printf("Erro ao criar barramento I2C: %s\n",
-               esp_err_to_name(err));
-        return;
-    }
+  VL53L5CX_Configuration *Dev = calloc(1, sizeof(VL53L5CX_Configuration));
+  VL53L5CX_ResultsData *Results = calloc(1, sizeof(VL53L5CX_ResultsData));
 
-    i2c_device_config_t device_config = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = VL53L5CX_DEFAULT_I2C_ADDRESS >> 1,
-        .scl_speed_hz = I2C_FREQUENCY_HZ,
-    };
+  printf("\n[%s] Inicializando barramento I2C...\n", platform->name);
 
-    err = i2c_master_bus_add_device(
-        bus_handle,
-        &device_config,
-        &Dev.platform.handle
+  i2c_master_bus_config_t i2c_config = {
+    .clk_source = I2C_CLK_SRC_DEFAULT,
+    .i2c_port = platform->i2c_port,
+    .scl_io_num = platform->scl_gpio,
+    .sda_io_num = platform->sda_gpio,
+    .glitch_ignore_cnt = 7,
+    .flags.enable_internal_pullup = true,
+  };
+
+  i2c_master_bus_handle_t bus_handle;
+
+  err = i2c_new_master_bus(&i2c_config, &bus_handle);
+  if(err != ESP_OK) {
+    printf(
+      "[%s] Erro ao criar barramento I2C: %s\n",
+      platform->name,
+      esp_err_to_name(err)
     );
+    return;
+  }
 
-    if (err != ESP_OK) {
-        printf("Erro ao adicionar dispositivo I2C: %s\n",
-               esp_err_to_name(err));
-        return;
-    }
+  i2c_device_config_t device_config = {
+    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+    .device_address = VL53L5CX_DEFAULT_I2C_ADDRESS >> 1,
+    .scl_speed_hz = platform->i2c_frequency_hz,
+  };
 
-    Dev.platform.bus_config = i2c_config;
-    Dev.platform.address = VL53L5CX_DEFAULT_I2C_ADDRESS;
-    Dev.platform.reset_gpio = GPIO_NUM_NC;
+  err = i2c_master_bus_add_device(
+    bus_handle,
+    &device_config,
+    &Dev->platform.handle
+  );
 
-    printf("Verificando sensor VL53L5CX...\n");
-
-    status = vl53l5cx_is_alive(&Dev, &is_alive);
-
-    if (status != VL53L5CX_STATUS_OK || !is_alive) {
-        printf("VL53L5CX nao detectado. Verifique as conexoes.\n");
-        return;
-    }
-
-    printf("Sensor detectado!\n");
-    printf("Inicializando driver...\n");
-
-    status = vl53l5cx_init(&Dev);
-
-    if (status != VL53L5CX_STATUS_OK) {
-        printf("Falha ao inicializar o sensor. Status: %u\n", status);
-        return;
-    }
-
-    status = vl53l5cx_set_resolution(
-        &Dev,
-        VL53L5CX_RESOLUTION_4X4
+  if(err != ESP_OK) {
+    printf(
+      "[%s] Erro ao adicionar dispositivo I2C: %s\n",
+      platform->name,
+      esp_err_to_name(err)
     );
+    return;
+  }
 
-    if (status != VL53L5CX_STATUS_OK) {
-        printf("Erro ao configurar resolucao 4x4: %u\n", status);
-        return;
-    }
+  Dev->platform.bus_config = i2c_config;
+  Dev->platform.address = VL53L5CX_DEFAULT_I2C_ADDRESS;
+  Dev->platform.reset_gpio = GPIO_NUM_NC;
 
-    status = vl53l5cx_set_ranging_frequency_hz(&Dev, 1);
+  printf("[%s] Verificando sensor VL53L5CX...\n", platform->name);
 
-    if (status != VL53L5CX_STATUS_OK) {
-        printf("Erro ao configurar frequencia: %u\n", status);
-        return;
-    }
+  status = vl53l5cx_is_alive(Dev, &is_alive);
 
-    status = vl53l5cx_start_ranging(&Dev);
+  if(status != VL53L5CX_STATUS_OK || !is_alive) {
+    printf(
+      "[%s] VL53L5CX nao detectado. Verifique as conexoes.\n",
+      platform->name
+    );
+    return;
+  }
 
-    if (status != VL53L5CX_STATUS_OK) {
-        printf("Erro ao iniciar medicao: %u\n", status);
-        return;
-    }
+  printf("[%s] Sensor detectado!\n", platform->name);
+  printf("[%s] Inicializando driver...\n", platform->name);
 
-    printf("\nSensor iniciado. Lendo 16 zonas...\n");
+  status = vl53l5cx_init(Dev);
 
-    while (1) {
-        is_ready = 0;
+  if(status != VL53L5CX_STATUS_OK) {
+    printf(
+      "[%s] Falha ao inicializar o sensor. Status: %u\n",
+      platform->name, status
+    );
+    return;
+  }
 
-        status = vl53l5cx_check_data_ready(&Dev, &is_ready);
+  status = vl53l5cx_set_resolution(
+    Dev,
+    VL53L5CX_RESOLUTION_4X4
+  );
 
-        if (status == VL53L5CX_STATUS_OK && is_ready) {
-            status = vl53l5cx_get_ranging_data(&Dev, &Results);
+  if(status != VL53L5CX_STATUS_OK) {
+    printf(
+      "[%s] Erro ao configurar resolucao 4x4: %u\n",
+      platform->name, status);
+    return;
+  }
 
-            if (status == VL53L5CX_STATUS_OK) {
-                printf("\nQuadro: %u\n", Dev.streamcount);
+  status = vl53l5cx_set_ranging_frequency_hz(Dev, 1);
 
-                for (zone = 0; zone < 16; zone++) {
-                    uint16_t index =
-                        VL53L5CX_NB_TARGET_PER_ZONE * zone;
+  if(status != VL53L5CX_STATUS_OK) {
+    printf(
+      "[%s] Erro ao configurar frequencia: %u\n",
+      platform->name, status
+    );
+    return;
+  }
 
-                    printf(
-                        "Zona %2u | Status: %u | Distancia: %d mm\n",
-                        zone,
-                        Results.target_status[index],
-                        Results.distance_mm[index]
-                    );
-                }
-            } else {
-                printf("Erro ao obter dados: %u\n", status);
-            }
-        } else if (status != VL53L5CX_STATUS_OK) {
-            printf("Erro ao verificar dados: %u\n", status);
+  status = vl53l5cx_start_ranging(Dev);
+
+  if(status != VL53L5CX_STATUS_OK) {
+    printf("[%s] Erro ao iniciar medicao: %u\n", platform->name, status);
+    return;
+  }
+
+  printf("\n[%s] Sensor iniciado. Lendo 16 zonas...\n", platform->name);
+
+  while(1) {
+    is_ready = 0;
+
+    status = vl53l5cx_check_data_ready(Dev, &is_ready);
+
+    if(status == VL53L5CX_STATUS_OK && is_ready) {
+      status = vl53l5cx_get_ranging_data(Dev, Results);
+
+      if(status == VL53L5CX_STATUS_OK) {
+        printf("\nQuadro: %u\n", Dev->streamcount);
+        for(zone = 0; zone < 16; zone++) {
+          uint16_t index = VL53L5CX_NB_TARGET_PER_ZONE * zone;
+          printf(
+            "[%s] Zona %2u | Status: %u | Distancia: %d mm\n",
+            platform->name,
+            zone,
+            Results->target_status[index],
+            Results->distance_mm[index]
+          );
         }
-
-        vTaskDelay(pdMS_TO_TICKS(5));
+      } else {
+        printf("[%s] Erro ao obter dados: %u\n", platform->name, status);
+      }
+    } else if(status != VL53L5CX_STATUS_OK) {
+      printf("[%s] Erro ao verificar dados: %u\n", platform->name, status);
     }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
 }
 
 void app_main(void) {
-  /*xTaskCreate(
-    pcm5102a,
-    "LED",
-    2048,
+  xTaskCreatePinnedToCore(
+    vl53l5c,
+    "TOF1",
+    8192,
+    &tof1_platform,
+    1,
     NULL,
-    2,
-    NULL
+    0
   );
 
-  xTaskCreate(
+  xTaskCreatePinnedToCore(
     vl53l5c,
-    "Serial",
-    2048,
-    NULL,
+    "TOF2",
+    8192,
+    &tof2_platform,
     1,
-    NULL
-  );*/
-  pcm5102a();
+    NULL,
+    0
+  );
+
+  xTaskCreatePinnedToCore(
+    pcm5102a,
+    "DAC",
+    4096,
+    NULL,
+    5,
+    NULL,
+    1
+  );
 }
